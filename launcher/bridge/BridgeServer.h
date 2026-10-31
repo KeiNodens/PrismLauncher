@@ -31,8 +31,10 @@
 #include <QStringList>
 #include <QVector>
 
+class QFileSystemWatcher;
 class QLocalServer;
 class QLocalSocket;
+class QTimer;
 class Task;
 
 class BridgeServer : public QObject {
@@ -51,6 +53,11 @@ class BridgeServer : public QObject {
         QLocalSocket* socket = nullptr;
         QByteArray buffer;
         bool subscribed = false;
+        // log.subscribe state (one log per client in v1)
+        QString logInstanceId;
+        QString logPath;
+        qint64 logOffset = 0;
+        QByteArray logPartial;
     };
 
     struct TrackedTask {
@@ -78,7 +85,12 @@ class BridgeServer : public QObject {
     QJsonObject taskJson(const TrackedTask& tracked) const;
     void notifyTask(const TrackedTask& tracked);
 
+    void pumpLog(Client* client);
+    void onLogDirectoryChanged(const QString& path);
+
     QLocalServer* m_server = nullptr;
+    QFileSystemWatcher* m_logWatcher = nullptr;
+    QTimer* m_logTimer = nullptr;
     QVector<Client*> m_clients;
     QHash<QString, TrackedTask> m_tasks;
     QStringList m_taskOrder;

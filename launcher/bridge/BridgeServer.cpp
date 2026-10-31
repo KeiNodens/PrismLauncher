@@ -4,10 +4,13 @@
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
+#include <QFileSystemWatcher>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QLocalServer>
 #include <QLocalSocket>
+#include <QTimer>
 #include <QtEndian>
 
 #include "Application.h"
@@ -109,6 +112,15 @@ bool BridgeServer::start()
     }
     connect(m_server, &QLocalServer::newConnection, this, &BridgeServer::onNewConnection);
     qInfo() << "Agent bridge listening on" << name << "for data dir" << dataDir;
+
+    m_logWatcher = new QFileSystemWatcher(this);
+    connect(m_logWatcher, &QFileSystemWatcher::directoryChanged, this, &BridgeServer::onLogDirectoryChanged);
+    // Backstop: directory watching alone misses logs/ dirs that do not exist
+    // yet at subscribe time (the game creates them at launch). Poll cheaply.
+    m_logTimer = new QTimer(this);
+    m_logTimer->setInterval(2000);
+    connect(m_logTimer, &QTimer::timeout, this, [this]() { onLogDirectoryChanged(QString()); });
+    m_logTimer->start();
 
     // Discovery file for clients (the MCP server / prism-ctl).
     const QString dirPath = FS::PathCombine(dataDir, QStringLiteral("prismlauncher-mcp"));
@@ -292,6 +304,63 @@ void BridgeServer::notifyTask(const TrackedTask& tracked)
     broadcastNotification(QStringLiteral("task.progress"), taskJson(tracked));
 }
 
+void BridgeServer::pumpLog(Client* client)
+{
+    if (client->logPath.isEmpty())
+        return;
+    QFile file(client->logPath);
+    if (!file.exists()) {
+        client->logOffset = 0;
+        client->logPartial.clear();
+        return;
+    }
+    if (file.size() < client->logOffset) {  // rotated or truncated
+        client->logOffset = 0;
+        client->logPartial.clear();
+    }
+    if (!file.open(QIODevice::ReadOnly))
+        return;
+    file.seek(client->logOffset);
+    QByteArray fresh = file.readAll();
+    client->logOffset = file.pos();
+    if (fresh.isEmpty())
+        return;
+
+    client->logPartial += fresh;
+    QJsonArray lines;
+    int newline;
+    while ((newline = client->logPartial.indexOf('\n')) >= 0) {
+        QByteArray line = client->logPartial.left(newline);
+        if (line.endsWith('\r'))
+            line.chop(1);
+        lines.append(QString::fromUtf8(line));
+        client->logPartial.remove(0, newline + 1);
+    }
+    if (lines.isEmpty())
+        return;
+    QJsonObject params;
+    params["id"] = client->logInstanceId;
+    params["lines"] = lines;
+    QJsonObject note;
+    note["method"] = QStringLiteral("log.line");
+    note["params"] = params;
+    sendJson(client, note);
+}
+
+void BridgeServer::onLogDirectoryChanged(const QString& path)
+{
+    Q_UNUSED(path);
+    for (auto* client : m_clients) {
+        if (client->logInstanceId.isEmpty())
+            continue;
+        // Start watching the logs dir as soon as it exists.
+        const QString logsDir = QFileInfo(client->logPath).absolutePath();
+        if (m_logWatcher && QDir(logsDir).exists() && !m_logWatcher->directories().contains(logsDir))
+            m_logWatcher->addPath(logsDir);
+        pumpLog(client);
+    }
+}
+
 QJsonValue BridgeServer::dispatch(const QString& method, const QJsonObject& params, Client* client, QString& errorCode,
                                   QString& errorMessage)
 {
@@ -456,6 +525,35 @@ QJsonValue BridgeServer::dispatch(const QString& method, const QJsonObject& para
         obj["id"] = id;
         obj["path"] = path;
         obj["lines"] = tail;
+        return obj;
+    }
+
+    if (method == QStringLiteral("log.subscribe")) {
+        const QString id = params.value("id").toString();
+        auto* inst = app->instances()->getInstanceById(id);
+        if (!inst)
+            return fail(QStringLiteral("not_found"), QStringLiteral("no instance with id %1").arg(id));
+        const QString logsDir = FS::PathCombine(inst->gameRoot(), QStringLiteral("logs"));
+        client->logInstanceId = id;
+        client->logPath = FS::PathCombine(logsDir, QStringLiteral("latest.log"));
+        client->logPartial.clear();
+        QFileInfo info(client->logPath);
+        client->logOffset = info.exists() ? info.size() : 0;  // stream only new lines
+        if (m_logWatcher && QDir(logsDir).exists() && !m_logWatcher->directories().contains(logsDir))
+            m_logWatcher->addPath(logsDir);
+        QJsonObject obj;
+        obj["id"] = id;
+        obj["subscribed"] = true;
+        return obj;
+    }
+
+    if (method == QStringLiteral("log.unsubscribe")) {
+        client->logInstanceId.clear();
+        client->logPath.clear();
+        client->logOffset = 0;
+        client->logPartial.clear();
+        QJsonObject obj;
+        obj["subscribed"] = false;
         return obj;
     }
 
