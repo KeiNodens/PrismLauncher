@@ -1,0 +1,508 @@
+#include "bridge/BridgeServer.h"
+
+#include <QCryptographicHash>
+#include <QDateTime>
+#include <QDir>
+#include <QFile>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QLocalServer>
+#include <QLocalSocket>
+#include <QtEndian>
+
+#include "Application.h"
+#include "BaseInstance.h"
+#include "FileSystem.h"
+#include "InstanceList.h"
+#include "meta/Index.h"
+#include "minecraft/launch/MinecraftTarget.h"
+#include "minecraft/VanillaInstanceCreationTask.h"
+#include "minecraft/auth/AccountList.h"
+#include "minecraft/auth/MinecraftAccount.h"
+#include "settings/SettingsObject.h"
+#include "tasks/Task.h"
+
+namespace {
+
+QJsonObject instanceJson(BaseInstance* inst)
+{
+    QJsonObject obj;
+    obj["id"] = inst->id();
+    obj["name"] = inst->name();
+    obj["icon"] = inst->iconKey();
+    obj["running"] = inst->isRunning();
+    obj["instanceRoot"] = inst->instanceRoot();
+    obj["gameRoot"] = inst->gameRoot();
+    return obj;
+}
+
+QVariant jsonToVariant(const QJsonValue& value)
+{
+    if (value.isBool())
+        return value.toBool();
+    if (value.isDouble()) {
+        double d = value.toDouble();
+        if (d == static_cast<double>(static_cast<qint64>(d)))
+            return static_cast<qint64>(d);
+        return d;
+    }
+    if (value.isString())
+        return value.toString();
+    return QVariant();
+}
+
+QString accountTypeName(AccountType type)
+{
+    switch (type) {
+        case AccountType::MSA:
+            return QStringLiteral("msa");
+        case AccountType::Offline:
+            return QStringLiteral("offline");
+        default:
+            return QStringLiteral("other");
+    }
+}
+
+}  // namespace
+
+BridgeServer::BridgeServer(QObject* parent) : QObject(parent) {}
+
+BridgeServer::~BridgeServer()
+{
+    for (auto* client : m_clients) {
+        if (client->socket)
+            client->socket->disconnectFromServer();
+        delete client;
+    }
+    if (m_server)
+        m_server->close();
+}
+
+QString BridgeServer::socketNameFor(const QString& dataDir)
+{
+    QString canonical = QDir(dataDir).canonicalPath();
+    if (canonical.isEmpty())
+        canonical = QDir(dataDir).absolutePath();
+    QByteArray hash = QCryptographicHash::hash(canonical.toUtf8(), QCryptographicHash::Sha1).toHex();
+    return QStringLiteral("pl") + QString::fromLatin1(hash.left(12)) + QStringLiteral("-bridge");
+}
+
+bool BridgeServer::isListening() const
+{
+    return m_server && m_server->isListening();
+}
+
+bool BridgeServer::start()
+{
+    if (isListening())
+        return true;
+
+    const QString dataDir = QDir::currentPath();
+    const QString name = socketNameFor(dataDir);
+
+    m_server = new QLocalServer(this);
+    // Remove a stale socket left by a crashed previous process (no-op on Windows).
+    QLocalServer::removeServer(name);
+    if (!m_server->listen(name)) {
+        qWarning() << "Agent bridge: failed to listen on" << name << ":" << m_server->errorString();
+        return false;
+    }
+    connect(m_server, &QLocalServer::newConnection, this, &BridgeServer::onNewConnection);
+    qInfo() << "Agent bridge listening on" << name << "for data dir" << dataDir;
+
+    // Discovery file for clients (the MCP server / prism-ctl).
+    const QString dirPath = FS::PathCombine(dataDir, QStringLiteral("prismlauncher-mcp"));
+    QDir().mkpath(dirPath);
+    QJsonObject info;
+    info["socketName"] = name;
+    info["pid"] = QCoreApplication::applicationPid();
+    info["startedAt"] = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    info["protocol"] = 1;
+    QFile file(FS::PathCombine(dirPath, QStringLiteral("bridge.json")));
+    if (file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        file.write(QJsonDocument(info).toJson(QJsonDocument::Indented));
+    }
+    return true;
+}
+
+void BridgeServer::onNewConnection()
+{
+    while (m_server->hasPendingConnections()) {
+        auto* socket = m_server->nextPendingConnection();
+        auto* client = new Client;
+        client->socket = socket;
+        m_clients.append(client);
+        connect(socket, &QLocalSocket::readyRead, this, [this, client]() { onReadyRead(client); });
+        connect(socket, &QLocalSocket::disconnected, this, [this, client]() {
+            m_clients.removeAll(client);
+            client->socket->deleteLater();
+            delete client;
+        });
+    }
+}
+
+void BridgeServer::onReadyRead(Client* client)
+{
+    client->buffer += client->socket->readAll();
+    while (client->buffer.size() >= 4) {
+        quint32 length = qFromBigEndian<quint32>(reinterpret_cast<const uchar*>(client->buffer.constData()));
+        if (length > 16 * 1024 * 1024) {  // sanity cap
+            client->socket->disconnectFromServer();
+            return;
+        }
+        if (client->buffer.size() < static_cast<int>(4 + length))
+            return;
+        QByteArray payload = client->buffer.mid(4, static_cast<int>(length));
+        client->buffer.remove(0, 4 + static_cast<int>(length));
+
+        QJsonParseError parseError;
+        QJsonDocument doc = QJsonDocument::fromJson(payload, &parseError);
+        if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+            QJsonObject error;
+            error["id"] = QJsonValue::Null;
+            QJsonObject detail;
+            detail["code"] = QStringLiteral("parse_error");
+            detail["message"] = parseError.errorString();
+            error["error"] = detail;
+            sendJson(client, error);
+            continue;
+        }
+        handleFrame(client, doc.object());
+    }
+}
+
+void BridgeServer::sendJson(Client* client, const QJsonObject& payload)
+{
+    if (!client->socket)
+        return;
+    QByteArray data = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+    QByteArray frame;
+    frame.resize(4);
+    qToBigEndian<quint32>(static_cast<quint32>(data.size()), reinterpret_cast<uchar*>(frame.data()));
+    frame += data;
+    client->socket->write(frame);
+    client->socket->flush();
+}
+
+void BridgeServer::broadcastNotification(const QString& method, const QJsonObject& params)
+{
+    QJsonObject note;
+    note["method"] = method;
+    note["params"] = params;
+    for (auto* client : m_clients) {
+        if (client->subscribed)
+            sendJson(client, note);
+    }
+}
+
+void BridgeServer::handleFrame(Client* client, const QJsonObject& request)
+{
+    const QString method = request.value("method").toString();
+    const QJsonValue id = request.value("id");
+    QJsonObject params = request.value("params").toObject();
+
+    QString errorCode;
+    QString errorMessage;
+    QJsonValue result = dispatch(method, params, client, errorCode, errorMessage);
+
+    QJsonObject response;
+    response["id"] = id;
+    if (errorCode.isEmpty()) {
+        response["result"] = result;
+    } else {
+        QJsonObject detail;
+        detail["code"] = errorCode;
+        detail["message"] = errorMessage;
+        response["error"] = detail;
+    }
+    sendJson(client, response);
+}
+
+QString BridgeServer::trackTask(Task* task, const QString& label)
+{
+    const QString id = QStringLiteral("task-%1").arg(++m_taskCounter);
+    TrackedTask tracked;
+    tracked.id = id;
+    tracked.label = label;
+    tracked.task = task;
+    m_tasks.insert(id, tracked);
+    m_taskOrder.append(id);
+
+    connect(task, &Task::progress, this, [this, id](qint64 current, qint64 total) {
+        auto it = m_tasks.find(id);
+        if (it == m_tasks.end())
+            return;
+        it->current = current;
+        it->total = total;
+        notifyTask(*it);
+    });
+    connect(task, &Task::status, this, [this, id](const QString& status) {
+        auto it = m_tasks.find(id);
+        if (it == m_tasks.end())
+            return;
+        it->statusText = status;
+        notifyTask(*it);
+    });
+    connect(task, &Task::finished, this, [this, id]() {
+        auto it = m_tasks.find(id);
+        if (it == m_tasks.end())
+            return;
+        Task* t = it->task;
+        if (t) {
+            if (t->getState() == Task::State::Succeeded)
+                it->state = QStringLiteral("succeeded");
+            else if (t->getState() == Task::State::AbortedByUser)
+                it->state = QStringLiteral("aborted");
+            else {
+                it->state = QStringLiteral("failed");
+                it->failReason = t->failReason();
+            }
+        }
+        notifyTask(*it);
+    });
+
+    // Keep at most the 20 most recent finished tasks.
+    while (m_taskOrder.size() > 20) {
+        const QString oldest = m_taskOrder.first();
+        auto it = m_tasks.find(oldest);
+        if (it != m_tasks.end() && it->state == QStringLiteral("running"))
+            break;
+        m_tasks.remove(oldest);
+        m_taskOrder.removeFirst();
+    }
+    return id;
+}
+
+QJsonObject BridgeServer::taskJson(const TrackedTask& tracked) const
+{
+    QJsonObject obj;
+    obj["id"] = tracked.id;
+    obj["label"] = tracked.label;
+    obj["state"] = tracked.state;
+    obj["current"] = tracked.current;
+    obj["total"] = tracked.total;
+    obj["status"] = tracked.statusText;
+    if (!tracked.failReason.isEmpty())
+        obj["failReason"] = tracked.failReason;
+    return obj;
+}
+
+void BridgeServer::notifyTask(const TrackedTask& tracked)
+{
+    broadcastNotification(QStringLiteral("task.progress"), taskJson(tracked));
+}
+
+QJsonValue BridgeServer::dispatch(const QString& method, const QJsonObject& params, Client* client, QString& errorCode,
+                                  QString& errorMessage)
+{
+    auto fail = [&errorCode, &errorMessage](const QString& code, const QString& message) {
+        errorCode = code;
+        errorMessage = message;
+        return QJsonValue();
+    };
+    Application* app = APPLICATION;
+
+    if (method == QStringLiteral("ping")) {
+        QJsonObject obj;
+        obj["bridge"] = QStringLiteral("prismlauncher-agent-bridge");
+        obj["protocol"] = 1;
+        obj["dataDir"] = QDir::currentPath();
+        return obj;
+    }
+
+    if (method == QStringLiteral("subscribe")) {
+        client->subscribed = true;
+        QJsonObject obj;
+        obj["subscribed"] = true;
+        return obj;
+    }
+
+    if (method == QStringLiteral("instance.list")) {
+        QJsonArray array;
+        auto* list = app->instances();
+        for (int i = 0; i < list->count(); i++)
+            array.append(instanceJson(list->at(i)));
+        return array;
+    }
+
+    if (method == QStringLiteral("instance.get")) {
+        const QString id = params.value("id").toString();
+        auto* inst = app->instances()->getInstanceById(id);
+        if (!inst)
+            return fail(QStringLiteral("not_found"), QStringLiteral("no instance with id %1").arg(id));
+        return instanceJson(inst);
+    }
+
+    if (method == QStringLiteral("instance.create")) {
+        const QString name = params.value("name").toString();
+        const QString versionId = params.value("version").toString();
+        if (name.isEmpty() || versionId.isEmpty())
+            return fail(QStringLiteral("invalid_params"), QStringLiteral("instance.create needs name and version"));
+
+        auto* index = app->metadataIndex();
+        auto version = index ? index->get(QStringLiteral("net.minecraft"), versionId) : nullptr;
+        if (!version)
+            return fail(QStringLiteral("unavailable"),
+                        QStringLiteral("Minecraft version %1 not found (meta index may still be loading)").arg(versionId));
+
+        VanillaCreationTask* creation = nullptr;
+        const QString loader = params.value("loader").toString();
+        if (!loader.isEmpty()) {
+            QString loaderUid;
+            if (loader == QStringLiteral("forge"))
+                loaderUid = QStringLiteral("net.minecraftforge");
+            else if (loader == QStringLiteral("neoforge"))
+                loaderUid = QStringLiteral("net.neoforged");
+            else if (loader == QStringLiteral("fabric"))
+                loaderUid = QStringLiteral("net.fabricmc.fabric-loader");
+            else if (loader == QStringLiteral("quilt"))
+                loaderUid = QStringLiteral("org.quiltmc.quilt-loader");
+            else
+                return fail(QStringLiteral("invalid_params"), QStringLiteral("unknown loader %1").arg(loader));
+
+            const QString loaderVersionId = params.value("loaderVersion").toString();
+            if (loaderVersionId.isEmpty())
+                return fail(QStringLiteral("invalid_params"), QStringLiteral("loaderVersion is required with loader"));
+            auto loaderVersion = index->get(loaderUid, loaderVersionId);
+            if (!loaderVersion)
+                return fail(QStringLiteral("unavailable"),
+                            QStringLiteral("loader version %1 %2 not found").arg(loaderUid, loaderVersionId));
+            creation = new VanillaCreationTask(version, loaderUid, loaderVersion);
+        } else {
+            creation = new VanillaCreationTask(version);
+        }
+        creation->setName(name);
+        const QString icon = params.value("icon").toString();
+        if (!icon.isEmpty())
+            creation->setIcon(icon);
+        const QString group = params.value("group").toString();
+        if (!group.isEmpty())
+            creation->setGroup(group);
+
+        Task* wrapped = app->instances()->wrapInstanceTask(creation);
+        wrapped->setParent(this);
+        const QString taskId = trackTask(wrapped, QStringLiteral("create instance %1").arg(name));
+        wrapped->start();
+        QJsonObject obj;
+        obj["taskId"] = taskId;
+        return obj;
+    }
+
+    if (method == QStringLiteral("launch") || method == QStringLiteral("launch.status") || method == QStringLiteral("launch.stop")) {
+        const QString id = params.value("id").toString();
+        auto* inst = app->instances()->getInstanceById(id);
+        if (!inst)
+            return fail(QStringLiteral("not_found"), QStringLiteral("no instance with id %1").arg(id));
+
+        if (method == QStringLiteral("launch.status")) {
+            QJsonObject obj;
+            obj["id"] = id;
+            obj["running"] = inst->isRunning();
+            return obj;
+        }
+        if (method == QStringLiteral("launch.stop")) {
+            bool ok = app->kill(inst);
+            QJsonObject obj;
+            obj["id"] = id;
+            obj["stopped"] = ok;
+            return obj;
+        }
+        // launch
+        MinecraftTarget::Ptr target;
+        const QString server = params.value("server").toString();
+        if (!server.isEmpty())
+            target.reset(new MinecraftTarget(MinecraftTarget::parse(server, false)));
+        MinecraftAccountPtr account;
+        const QString profile = params.value("profile").toString();
+        if (!profile.isEmpty()) {
+            account = app->accounts()->getAccountByProfileName(profile);
+            if (!account)
+                return fail(QStringLiteral("not_found"), QStringLiteral("no account with profile name %1").arg(profile));
+        }
+        const QString offlineName = params.value("offlineName").toString();
+        bool ok;
+        if (!offlineName.isEmpty())
+            ok = app->launch(inst, LaunchMode::Offline, target, account, offlineName);
+        else
+            ok = app->launch(inst, LaunchMode::Normal, target, account);
+        QJsonObject obj;
+        obj["id"] = id;
+        obj["launched"] = ok;
+        return obj;
+    }
+
+    if (method == QStringLiteral("log.tail")) {
+        const QString id = params.value("id").toString();
+        auto* inst = app->instances()->getInstanceById(id);
+        if (!inst)
+            return fail(QStringLiteral("not_found"), QStringLiteral("no instance with id %1").arg(id));
+        const int lines = params.value("lines").toInt(100);
+        const QString path = FS::PathCombine(inst->gameRoot(), QStringLiteral("logs/latest.log"));
+        QFile file(path);
+        if (!file.exists()) {
+            QJsonObject obj;
+            obj["id"] = id;
+            obj["path"] = path;
+            obj["lines"] = QJsonArray();
+            return obj;
+        }
+        if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
+            return fail(QStringLiteral("internal"), QStringLiteral("cannot open %1").arg(path));
+        QStringList all = QString::fromUtf8(file.readAll()).split('\n');
+        QJsonArray tail;
+        for (int i = qMax(0, static_cast<int>(all.size()) - lines); i < all.size(); i++)
+            tail.append(all.at(i));
+        QJsonObject obj;
+        obj["id"] = id;
+        obj["path"] = path;
+        obj["lines"] = tail;
+        return obj;
+    }
+
+    if (method == QStringLiteral("settings.get")) {
+        const QString key = params.value("key").toString();
+        if (key.isEmpty())
+            return fail(QStringLiteral("invalid_params"), QStringLiteral("settings.get needs key"));
+        QJsonObject obj;
+        obj["key"] = key;
+        obj["value"] = QJsonValue::fromVariant(app->settings()->get(key));
+        return obj;
+    }
+
+    if (method == QStringLiteral("settings.set")) {
+        const QString key = params.value("key").toString();
+        if (key.isEmpty() || !params.contains("value"))
+            return fail(QStringLiteral("invalid_params"), QStringLiteral("settings.set needs key and value"));
+        app->settings()->set(key, jsonToVariant(params.value("value")));
+        QJsonObject obj;
+        obj["key"] = key;
+        obj["value"] = QJsonValue::fromVariant(app->settings()->get(key));
+        return obj;
+    }
+
+    if (method == QStringLiteral("account.list")) {
+        QJsonArray array;
+        auto* accounts = app->accounts();
+        for (int i = 0; i < accounts->count(); i++) {
+            auto account = accounts->at(i);
+            QJsonObject obj;
+            obj["profileName"] = account->profileName();
+            obj["type"] = accountTypeName(account->accountType());
+            obj["active"] = account->isActive();
+            array.append(obj);
+        }
+        return array;
+    }
+
+    if (method == QStringLiteral("task.list")) {
+        QJsonArray array;
+        for (const QString& id : m_taskOrder) {
+            auto it = m_tasks.find(id);
+            if (it != m_tasks.end())
+                array.append(taskJson(*it));
+        }
+        return array;
+    }
+
+    return fail(QStringLiteral("unknown_method"), QStringLiteral("unknown method %1").arg(method));
+}

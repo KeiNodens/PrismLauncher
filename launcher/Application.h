@@ -96,6 +96,8 @@ class Index;
 #endif
 #define APPLICATION_DYN (dynamic_cast<Application*>(QCoreApplication::instance()))
 
+class BridgeServer;
+
 class Application : public QApplication {
     Q_OBJECT
    public:
@@ -232,6 +234,7 @@ class Application : public QApplication {
     bool handleDataMigration(const QString& currentData, const QString& oldData, const QString& name, const QString& configFile) const;
     bool createSetupWizard();
     void performMainStartupAction();
+    void startAgentBridge();
 
     // sets the fatal error message and m_status to Failed.
     void showFatalErrorMessage(const QString& title, const QString& content);
@@ -315,6 +318,8 @@ class Application : public QApplication {
     QList<QUrl> m_urlsToImport;
     QString m_instanceIdToShowWindowOf;
     bool m_showMainWindow = false;
+    bool m_agentHeadless = false;
+    BridgeServer* m_agentBridge = nullptr;
     std::unique_ptr<QFile> logFile;
     std::unique_ptr<LogModel> logModel;
 

@@ -125,6 +125,8 @@
 #include <FileSystem.h>
 #include <LocalPeer.h>
 
+#include "bridge/BridgeServer.h"
+
 #include <stdlib.h>
 #include "SysInfo.h"
 
@@ -320,7 +322,8 @@ Application::Application(int& argc, char** argv) : QApplication(argc, argv)
           { "alive", "Write a small '" + liveCheckFile + "' file after the launcher starts" },
           { "show-window", "Show the main launcher window (useful in combination with --launch)" },
           { { "I", "import" }, "Import instance or resource from specified local path or URL", "url" },
-          { "show", "Opens the window for the specified instance (by instance ID)", "show" } });
+          { "show", "Opens the window for the specified instance (by instance ID)", "show" },
+          { "agent-headless", "Run without the main window; only the agent bridge is served" } });
     // Has to be positional for some OS to handle that properly
     parser.addPositionalArgument("URL", "Import the resource(s) at the given URL(s) (same as -I / --import)", "[URL...]");
 
@@ -341,6 +344,7 @@ Application::Application(int& argc, char** argv) : QApplication(argc, argv)
 
     m_instanceIdToShowWindowOf = parser.value("show");
     m_showMainWindow = parser.isSet("show-window");
+    m_agentHeadless = parser.isSet("agent-headless");
 
     for (auto url : parser.values("import")) {
         m_urlsToImport.append(normalizeImportUrl(url));
@@ -650,6 +654,7 @@ Application::Application(int& argc, char** argv) : QApplication(argc, argv)
 
         m_settings->registerSetting("MenuBarInsteadOfToolBar", false);
 
+        m_settings->registerSetting("AgentBridgeEnabled", true);
         m_settings->registerSetting("NumberOfConcurrentTasks", 10);
         m_settings->registerSetting("NumberOfConcurrentDownloads", 6);
         m_settings->registerSetting("NumberOfManualRetries", 1);
@@ -1196,6 +1201,10 @@ Application::Application(int& argc, char** argv) : QApplication(argc, argv)
 
 bool Application::createSetupWizard()
 {
+    if (m_agentHeadless) {
+        qDebug() << "Agent headless mode: setup wizard skipped.";
+        return false;
+    }
     bool javaRequired = [this]() {
         if (BuildConfig.JAVA_DOWNLOADER_ENABLED && settings()->get("AutomaticJavaDownload").toBool()) {
             return false;
@@ -1322,6 +1331,7 @@ void Application::setupWizardFinished(int status)
 void Application::performMainStartupAction()
 {
     m_status = Application::Initialized;
+    startAgentBridge();
     if (!m_instanceIdToLaunch.isEmpty()) {
         auto inst = instances()->getInstanceById(m_instanceIdToLaunch);
         if (inst) {
@@ -1361,14 +1371,14 @@ void Application::performMainStartupAction()
             return;
         }
     }
-    if (!m_mainWindow) {
+    if (!m_mainWindow && !m_agentHeadless) {
         // normal main window
         showMainWindow(false);
         qDebug() << "<> Main window shown.";
     }
 
     // initialize the updater
-    if (updaterEnabled()) {
+    if (updaterEnabled() && !m_agentHeadless) {
         qDebug() << "Initializing updater";
 #ifdef Q_OS_MAC
 #if defined(SPARKLE_ENABLED)
@@ -1386,7 +1396,7 @@ void Application::performMainStartupAction()
         FS::deletePath(tempRoot);
     }
 
-    if (!m_urlsToImport.isEmpty()) {
+    if (!m_urlsToImport.isEmpty() && m_mainWindow) {
         qDebug() << "<> Importing from url:" << m_urlsToImport;
         m_mainWindow->processURLs(m_urlsToImport);
     }
@@ -2042,4 +2052,22 @@ bool Application::checkQSavePath(QString path)
         }
     }
     return false;
+}
+
+
+void Application::startAgentBridge()
+{
+    if (m_agentBridge) {
+        return;
+    }
+    if (!m_settings->get("AgentBridgeEnabled").toBool()) {
+        qDebug() << "Agent bridge disabled by the AgentBridgeEnabled setting.";
+        return;
+    }
+    m_agentBridge = new BridgeServer(this);
+    if (!m_agentBridge->start()) {
+        qWarning() << "Agent bridge failed to start.";
+        delete m_agentBridge;
+        m_agentBridge = nullptr;
+    }
 }

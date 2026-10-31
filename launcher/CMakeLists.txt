@@ -793,6 +793,8 @@ SET(LAUNCHER_SOURCES
     # Application base
     Application.h
     Application.cpp
+    bridge/BridgeServer.h
+    bridge/BridgeServer.cpp
     DataMigrationTask.h
     DataMigrationTask.cpp
     ApplicationMessage.h
