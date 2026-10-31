@@ -22,6 +22,9 @@
 #include "minecraft/VanillaInstanceCreationTask.h"
 #include "minecraft/auth/AccountList.h"
 #include "minecraft/auth/MinecraftAccount.h"
+#include "modplatform/ModIndex.h"
+#include "modplatform/ResourceAPI.h"
+#include "modplatform/modrinth/ModrinthAPI.h"
 #include "settings/SettingsObject.h"
 #include "tasks/Task.h"
 
@@ -146,6 +149,7 @@ void BridgeServer::onNewConnection()
         m_clients.append(client);
         connect(socket, &QLocalSocket::readyRead, this, [this, client]() { onReadyRead(client); });
         connect(socket, &QLocalSocket::disconnected, this, [this, client]() {
+            *client->alive = false;
             m_clients.removeAll(client);
             client->socket->deleteLater();
             delete client;
@@ -183,17 +187,38 @@ void BridgeServer::onReadyRead(Client* client)
     }
 }
 
-void BridgeServer::sendJson(Client* client, const QJsonObject& payload)
+void BridgeServer::writeFrame(QLocalSocket* socket, const QJsonObject& payload)
 {
-    if (!client->socket)
+    if (!socket)
         return;
     QByteArray data = QJsonDocument(payload).toJson(QJsonDocument::Compact);
     QByteArray frame;
     frame.resize(4);
     qToBigEndian<quint32>(static_cast<quint32>(data.size()), reinterpret_cast<uchar*>(frame.data()));
     frame += data;
-    client->socket->write(frame);
-    client->socket->flush();
+    socket->write(frame);
+    socket->flush();
+}
+
+void BridgeServer::sendJson(Client* client, const QJsonObject& payload)
+{
+    writeFrame(client->socket, payload);
+}
+
+void BridgeServer::sendResponse(QLocalSocket* socket, const QJsonValue& id, const QJsonValue& result, const QString& errorCode,
+                                const QString& errorMessage)
+{
+    QJsonObject response;
+    response["id"] = id;
+    if (errorCode.isEmpty()) {
+        response["result"] = result;
+    } else {
+        QJsonObject detail;
+        detail["code"] = errorCode;
+        detail["message"] = errorMessage;
+        response["error"] = detail;
+    }
+    writeFrame(socket, response);
 }
 
 void BridgeServer::broadcastNotification(const QString& method, const QJsonObject& params)
@@ -213,21 +238,68 @@ void BridgeServer::handleFrame(Client* client, const QJsonObject& request)
     const QJsonValue id = request.value("id");
     QJsonObject params = request.value("params").toObject();
 
+    // Async methods respond from callbacks, not from dispatch().
+    if (method == QStringLiteral("mod.search")) {
+        handleModSearch(client, id, params);
+        return;
+    }
+
     QString errorCode;
     QString errorMessage;
     QJsonValue result = dispatch(method, params, client, errorCode, errorMessage);
+    sendResponse(client->socket, id, result, errorCode, errorMessage);
+}
 
-    QJsonObject response;
-    response["id"] = id;
-    if (errorCode.isEmpty()) {
-        response["result"] = result;
-    } else {
-        QJsonObject detail;
-        detail["code"] = errorCode;
-        detail["message"] = errorMessage;
-        response["error"] = detail;
+void BridgeServer::handleModSearch(Client* client, const QJsonValue& id, const QJsonObject& params)
+{
+    const QString query = params.value("query").toString();
+    auto socket = client->socket;
+    auto alive = client->alive;
+
+    auto api = std::make_shared<ModrinthAPI>();
+    ResourceAPI::Callback<QList<ModPlatform::IndexedPack::Ptr>> callbacks{};
+    callbacks.on_succeed = [this, socket, alive, id, api](QList<ModPlatform::IndexedPack::Ptr>& packs) {
+        if (!*alive)
+            return;
+        QJsonArray hits;
+        for (const auto& pack : packs) {
+            QJsonObject hit;
+            hit["id"] = pack->addonId.toString();
+            hit["slug"] = pack->slug;
+            hit["name"] = pack->name;
+            hit["description"] = pack->description;
+            QJsonArray authors;
+            for (const auto& author : pack->authors)
+                authors.append(author.name);
+            hit["authors"] = authors;
+            hit["websiteUrl"] = pack->websiteUrl;
+            hits.append(hit);
+        }
+        QJsonObject result;
+        result["hits"] = hits;
+        sendResponse(socket, id, result, QString(), QString());
+    };
+    callbacks.on_fail = [this, socket, alive, id, api](QString reason, int) {
+        if (*alive)
+            sendResponse(socket, id, QJsonValue(), QStringLiteral("upstream"), QStringLiteral("Modrinth search failed: %1").arg(reason));
+    };
+    callbacks.on_abort = [this, socket, alive, id, api]() {
+        if (*alive)
+            sendResponse(socket, id, QJsonValue(), QStringLiteral("upstream"), QStringLiteral("Modrinth search aborted"));
+    };
+
+    ResourceAPI::SortingMethod sort{};
+    sort.name = QStringLiteral("relevance");
+    auto job = api->searchProjects({ ModPlatform::ResourceType::Mod, 0, query, sort, {}, {}, ModPlatform::Side::NoSide, {}, {} },
+                                   std::move(callbacks));
+    if (!job) {
+        sendResponse(socket, id, QJsonValue(), QStringLiteral("upstream"), QStringLiteral("could not create search job"));
+        return;
     }
-    sendJson(client, response);
+    Task::Ptr jobPtr = job;
+    m_pendingJobs.append(jobPtr);
+    connect(job.get(), &Task::finished, this, [this, jobPtr]() { m_pendingJobs.removeAll(jobPtr); });
+    job->start();
 }
 
 QString BridgeServer::trackTask(Task* task, const QString& label)

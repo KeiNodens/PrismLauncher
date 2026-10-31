@@ -25,17 +25,21 @@
 #include <QHash>
 #include <QJsonObject>
 #include <QJsonValue>
+#include <QList>
 #include <QObject>
 #include <QPointer>
 #include <QString>
 #include <QStringList>
 #include <QVector>
 
+#include <memory>
+
+#include "tasks/Task.h"
+
 class QFileSystemWatcher;
 class QLocalServer;
 class QLocalSocket;
 class QTimer;
-class Task;
 
 class BridgeServer : public QObject {
     Q_OBJECT
@@ -53,6 +57,9 @@ class BridgeServer : public QObject {
         QLocalSocket* socket = nullptr;
         QByteArray buffer;
         bool subscribed = false;
+        // Set to false when the client disconnects; async callbacks capture
+        // this flag (plus the socket) instead of the Client itself.
+        std::shared_ptr<bool> alive = std::make_shared<bool>(true);
         // log.subscribe state (one log per client in v1)
         QString logInstanceId;
         QString logPath;
@@ -75,6 +82,10 @@ class BridgeServer : public QObject {
     void onReadyRead(Client* client);
     void handleFrame(Client* client, const QJsonObject& request);
     void sendJson(Client* client, const QJsonObject& payload);
+    static void writeFrame(QLocalSocket* socket, const QJsonObject& payload);
+    void sendResponse(QLocalSocket* socket, const QJsonValue& id, const QJsonValue& result, const QString& errorCode,
+                      const QString& errorMessage);
+    void handleModSearch(Client* client, const QJsonValue& id, const QJsonObject& params);
     void broadcastNotification(const QString& method, const QJsonObject& params);
 
     // Returns the result value on success; on failure returns a null QJsonValue
@@ -91,6 +102,7 @@ class BridgeServer : public QObject {
     QLocalServer* m_server = nullptr;
     QFileSystemWatcher* m_logWatcher = nullptr;
     QTimer* m_logTimer = nullptr;
+    QList<Task::Ptr> m_pendingJobs;
     QVector<Client*> m_clients;
     QHash<QString, TrackedTask> m_tasks;
     QStringList m_taskOrder;
