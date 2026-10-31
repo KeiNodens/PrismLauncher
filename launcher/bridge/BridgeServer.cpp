@@ -37,6 +37,12 @@
 #include "minecraft/mod/ModFolderModel.h"
 #include "settings/SettingsObject.h"
 #include "tasks/Task.h"
+#include "modplatform/modrinth/ModrinthPackExportTask.h"
+#include "archive/ExportToZipTask.h"
+#include "java/JavaUtils.h"
+#include <QProcess>
+#include <QRegularExpression>
+#include <QSet>
 
 namespace {
 
@@ -899,8 +905,11 @@ QJsonValue BridgeServer::dispatch(const QString& method, const QJsonObject& para
         // launch
         MinecraftTarget::Ptr target;
         const QString server = params.value("server").toString();
+        const QString world = params.value("world").toString();
         if (!server.isEmpty())
             target.reset(new MinecraftTarget(MinecraftTarget::parse(server, false)));
+        else if (!world.isEmpty())
+            target.reset(new MinecraftTarget(MinecraftTarget::parse(world, true)));
         MinecraftAccountPtr account;
         const QString profile = params.value("profile").toString();
         if (!profile.isEmpty()) {
@@ -1027,6 +1036,98 @@ QJsonValue BridgeServer::dispatch(const QString& method, const QJsonObject& para
         obj["key"] = key;
         obj["value"] = QJsonValue::fromVariant(inst->settings()->get(key));
         return obj;
+    }
+
+    if (method == QStringLiteral("instance.export")) {
+        const QString id = params.value("id").toString();
+        auto* inst = app->instances()->getInstanceById(id);
+        if (!inst)
+            return fail(QStringLiteral("not_found"), QStringLiteral("no instance with id %1").arg(id));
+        auto* mcInst = dynamic_cast<MinecraftInstance*>(inst);
+        if (!mcInst)
+            return fail(QStringLiteral("unsupported"), QStringLiteral("instance %1 is not a Minecraft instance").arg(id));
+        const QString format = params.value("format").toString(QStringLiteral("mrpack"));
+        if (format != QStringLiteral("mrpack") && format != QStringLiteral("zip"))
+            return fail(QStringLiteral("invalid_params"), QStringLiteral("instance.export format must be mrpack or zip"));
+        QString output = params.value("output").toString();
+        if (output.isEmpty()) {
+            QDir dir(FS::PathCombine(QDir::currentPath(), QStringLiteral("prismlauncher-mcp"), QStringLiteral("exports")));
+            dir.mkpath(QStringLiteral("."));
+            const QString stamp = QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss"));
+            output = dir.filePath(QStringLiteral("%1-%2.%3").arg(inst->name(), stamp, format));
+        }
+        // Exclude filter (true = keep out): runtime noise that never belongs
+        // in an exported pack. Matches the spirit of the GUI's ignore proxy.
+        auto exclude = [](const QFileInfo& file) {
+            const QString p = file.absoluteFilePath().replace(QLatin1Char('\\'), QLatin1Char('/'));
+            if (p.contains(QStringLiteral("/logs/")) || p.contains(QStringLiteral("/crash-reports/")) ||
+                p.contains(QStringLiteral("/backups/")))
+                return true;
+            const QString n = file.fileName();
+            return n.endsWith(QStringLiteral(".log")) || n == QStringLiteral("session.lock") || n.endsWith(QStringLiteral(".lck"));
+        };
+        Task* task = nullptr;
+        if (format == QStringLiteral("mrpack")) {
+            QString name = params.value("name").toString();
+            if (name.isEmpty())
+                name = inst->settings()->get(QStringLiteral("ExportName")).toString();
+            if (name.isEmpty())
+                name = inst->name();
+            QString version = params.value("version").toString();
+            if (version.isEmpty())
+                version = inst->settings()->get(QStringLiteral("ExportVersion")).toString();
+            if (version.isEmpty())
+                version = QStringLiteral("1.0.0");
+            const QString summary = params.value("summary").toString(inst->settings()->get(QStringLiteral("ExportSummary")).toString());
+            task = new ModrinthPackExportTask(name, version, summary, false, inst, output, exclude);
+        } else {
+            QFileInfoList files;
+            MMCZip::collectFileListRecursively(inst->instanceRoot(), QString(), &files, exclude);
+            QFileInfoList fileOnly;
+            for (const auto& fi : files) {
+                if (fi.isFile())
+                    fileOnly.append(fi);
+            }
+            task = new MMCZip::ExportToZipTask(output, QDir(inst->instanceRoot()), fileOnly, QString(), true);
+        }
+        task->setParent(this);
+        const QString taskId = trackTask(task, QStringLiteral("export instance %1").arg(inst->name()));
+        task->start();
+        QJsonObject obj;
+        obj["taskId"] = taskId;
+        obj["output"] = output;
+        obj["format"] = format;
+        return obj;
+    }
+
+    if (method == QStringLiteral("java.list")) {
+        JavaUtils utils;
+        const QList<QString> paths = utils.FindJavaPaths();
+        QJsonArray array;
+        QSet<QString> seen;
+        const QRegularExpression versionPattern(QStringLiteral("version \"([0-9]+(?:\\.[0-9]+)*)"));
+        for (const QString& path : paths) {
+            const QString normalized = QDir::cleanPath(path);
+            if (seen.contains(normalized))
+                continue;
+            seen.insert(normalized);
+            QJsonObject obj;
+            obj["path"] = path;
+            QProcess proc;
+            proc.start(path, { QStringLiteral("-version") });
+            QString version;
+            if (proc.waitForStarted(1500) && proc.waitForFinished(2500)) {
+                const QString err = QString::fromLocal8Bit(proc.readAllStandardError());
+                const auto match = versionPattern.match(err);
+                if (match.hasMatch())
+                    version = match.captured(1);
+            } else {
+                proc.kill();
+            }
+            obj["version"] = version.isEmpty() ? QJsonValue() : QJsonValue(version);
+            array.append(obj);
+        }
+        return array;
     }
 
     if (method == QStringLiteral("account.list")) {
