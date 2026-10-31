@@ -998,6 +998,37 @@ QJsonValue BridgeServer::dispatch(const QString& method, const QJsonObject& para
         return obj;
     }
 
+    if (method == QStringLiteral("instance.settings.get")) {
+        const QString id = params.value("id").toString();
+        const QString key = params.value("key").toString();
+        if (id.isEmpty() || key.isEmpty())
+            return fail(QStringLiteral("invalid_params"), QStringLiteral("instance.settings.get needs id and key"));
+        auto* inst = app->instances()->getInstanceById(id);
+        if (!inst)
+            return fail(QStringLiteral("not_found"), QStringLiteral("no instance with id %1").arg(id));
+        QJsonObject obj;
+        obj["id"] = id;
+        obj["key"] = key;
+        obj["value"] = QJsonValue::fromVariant(inst->settings()->get(key));
+        return obj;
+    }
+
+    if (method == QStringLiteral("instance.settings.set")) {
+        const QString id = params.value("id").toString();
+        const QString key = params.value("key").toString();
+        if (id.isEmpty() || key.isEmpty() || !params.contains("value"))
+            return fail(QStringLiteral("invalid_params"), QStringLiteral("instance.settings.set needs id, key and value"));
+        auto* inst = app->instances()->getInstanceById(id);
+        if (!inst)
+            return fail(QStringLiteral("not_found"), QStringLiteral("no instance with id %1").arg(id));
+        inst->settings()->set(key, jsonToVariant(params.value("value")));
+        QJsonObject obj;
+        obj["id"] = id;
+        obj["key"] = key;
+        obj["value"] = QJsonValue::fromVariant(inst->settings()->get(key));
+        return obj;
+    }
+
     if (method == QStringLiteral("account.list")) {
         QJsonArray array;
         auto* accounts = app->accounts();
