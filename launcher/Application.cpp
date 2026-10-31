@@ -2065,6 +2065,7 @@ void Application::startAgentBridge()
         return;
     }
     m_agentBridge = new BridgeServer(this);
+    m_agentBridge->setHeadless(m_agentHeadless);
     if (!m_agentBridge->start()) {
         qWarning() << "Agent bridge failed to start.";
         delete m_agentBridge;

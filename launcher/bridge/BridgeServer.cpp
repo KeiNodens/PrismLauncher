@@ -26,6 +26,11 @@
 #include "modplatform/ResourceAPI.h"
 #include "modplatform/modrinth/ModrinthAPI.h"
 #include "ResourceDownloadTask.h"
+#include "InstanceImportTask.h"
+#include "MmcZip.h"
+#include "net/Download.h"
+#include "net/NetJob.h"
+#include <QTemporaryDir>
 #include "minecraft/MinecraftInstance.h"
 #include "minecraft/PackProfile.h"
 #include "net/Mode.h"
@@ -252,6 +257,10 @@ void BridgeServer::handleFrame(Client* client, const QJsonObject& request)
         handleModInstall(client, id, params);
         return;
     }
+    if (method == QStringLiteral("pack.create")) {
+        handlePackCreate(client, id, params);
+        return;
+    }
 
     QString errorCode;
     QString errorMessage;
@@ -440,6 +449,181 @@ void BridgeServer::handleModInstall(Client* client, const QJsonValue& id, const 
             args.loaders = loaderTypes;
         args.resourceType = ModPlatform::ResourceType::Mod;
 
+        auto job = api->getProjectVersions(std::move(args), std::move(callbacks));
+        if (!job) {
+            respondError(QStringLiteral("upstream"), QStringLiteral("could not create versions job"));
+            return;
+        }
+        Task::Ptr jobPtr = job;
+        m_pendingJobs.append(jobPtr);
+        connect(job.get(), &Task::finished, this, [this, jobPtr]() { m_pendingJobs.removeAll(jobPtr); });
+        job->start();
+    };
+    infoCallbacks.on_fail = [respondError](QString reason, int) {
+        respondError(QStringLiteral("upstream"), QStringLiteral("Modrinth project lookup failed: %1").arg(reason));
+    };
+    infoCallbacks.on_abort = [respondError]() { respondError(QStringLiteral("upstream"), QStringLiteral("Modrinth project lookup aborted")); };
+
+    auto infoJob = api->getProjectInfo({ pack }, std::move(infoCallbacks), false);
+    if (!infoJob) {
+        respondError(QStringLiteral("upstream"), QStringLiteral("could not create project info job"));
+        return;
+    }
+    Task::Ptr infoJobPtr = infoJob;
+    m_pendingJobs.append(infoJobPtr);
+    connect(infoJob.get(), &Task::finished, this, [this, infoJobPtr]() { m_pendingJobs.removeAll(infoJobPtr); });
+    infoJob->start();
+}
+
+
+void BridgeServer::handlePackCreate(Client* client, const QJsonValue& id, const QJsonObject& params)
+{
+    auto socket = client->socket;
+    auto alive = client->alive;
+    auto respondError = [this, socket, alive, id](const QString& code, const QString& message) {
+        if (*alive)
+            sendResponse(socket, id, QJsonValue(), code, message);
+    };
+
+    const QString projectId = params.value("projectId").toString();
+    const QString wantedVersionId = params.value("versionId").toString();
+    const QString requestedName = params.value("name").toString();
+    if (projectId.isEmpty()) {
+        respondError(QStringLiteral("invalid_params"), QStringLiteral("pack.create needs projectId"));
+        return;
+    }
+
+    auto pack = std::make_shared<ModPlatform::IndexedPack>();
+    pack->addonId = projectId;
+    pack->provider = ModPlatform::ResourceProvider::MODRINTH;
+
+    auto api = std::make_shared<ModrinthAPI>();
+    ResourceAPI::Callback<ModPlatform::IndexedPack::Ptr> infoCallbacks{};
+    infoCallbacks.on_succeed = [this, socket, alive, id, api, wantedVersionId, requestedName,
+                                respondError](ModPlatform::IndexedPack::Ptr& enriched) {
+        if (!*alive)
+            return;
+        ResourceAPI::Callback<QVector<ModPlatform::IndexedVersion>> callbacks{};
+        callbacks.on_succeed = [this, socket, alive, id, enriched, wantedVersionId, requestedName,
+                                 respondError](QVector<ModPlatform::IndexedVersion>& versions) {
+            if (!*alive)
+                return;
+            const ModPlatform::IndexedVersion* chosen = nullptr;
+            for (const auto& version : versions) {
+                if (!wantedVersionId.isEmpty()) {
+                    if (version.fileId.toString() == wantedVersionId || version.addonId.toString() == wantedVersionId)
+                        chosen = &version;
+                    continue;
+                }
+                if (!chosen || (chosen->version_type != ModPlatform::IndexedVersionType::Release &&
+                                version.version_type == ModPlatform::IndexedVersionType::Release))
+                    chosen = &version;
+            }
+            if (!chosen) {
+                respondError(QStringLiteral("not_found"), QStringLiteral("no modpack version found for this project"));
+                return;
+            }
+            ModPlatform::IndexedVersion version = *chosen;
+
+            // Pre-flight: download the .mrpack once and read its index before
+            // starting the real import. ModrinthCreationTask (inside
+            // InstanceImportTask) can block on modal dialogs: the optional-mod
+            // picker when the pack declares optional client files, and a
+            // message box when the index is missing. In headless mode nobody
+            // can answer those, so refuse up front with a clear error; the
+            // pre-flight index read covers the missing-index case in both
+            // modes. The import task downloads the pack again itself.
+            auto tmpDir = std::make_shared<QTemporaryDir>();
+            if (!tmpDir->isValid()) {
+                respondError(QStringLiteral("internal"), QStringLiteral("could not create a temp dir"));
+                return;
+            }
+            const QString mrpackPath = tmpDir->filePath(QStringLiteral("pack.mrpack"));
+            // A bare Net::Download has no network manager and crashes when
+            // started directly; downloads must run inside a NetJob bound to
+            // the application network (the pattern every upstream task uses).
+            auto download = makeShared<NetJob>(QStringLiteral("bridge pack preflight"), APPLICATION->network());
+            download->addNetAction(Net::Download::makeFile(QUrl(version.downloadUrl), mrpackPath));
+            Task::Ptr downloadHolder = download;
+            m_pendingJobs.append(downloadHolder);
+            connect(download.get(), &Task::failed, this, [this, downloadHolder, respondError](const QString& reason) {
+                m_pendingJobs.removeAll(downloadHolder);
+                respondError(QStringLiteral("upstream"), QStringLiteral("modpack download failed: %1").arg(reason));
+            });
+            connect(download.get(), &Task::aborted, this, [this, downloadHolder, respondError]() {
+                m_pendingJobs.removeAll(downloadHolder);
+                respondError(QStringLiteral("upstream"), QStringLiteral("modpack download aborted"));
+            });
+            connect(download.get(), &Task::succeeded, this,
+                    [this, socket, alive, id, tmpDir, mrpackPath, downloadHolder, version, enriched, requestedName, respondError]() {
+                        m_pendingJobs.removeAll(downloadHolder);
+                        if (!*alive)
+                            return;
+                        const QString indexPath = tmpDir->filePath(QStringLiteral("modrinth.index.json"));
+                        QFile indexFile(indexPath);
+                        QJsonObject index;
+                        if (MMCZip::extractFile(mrpackPath, QStringLiteral("modrinth.index.json"), indexPath) && indexFile.open(QIODevice::ReadOnly)) {
+                            QJsonParseError parseError{};
+                            const QJsonDocument doc = QJsonDocument::fromJson(indexFile.readAll(), &parseError);
+                            if (parseError.error == QJsonParseError::NoError && doc.isObject())
+                                index = doc.object();
+                        }
+                        if (index.isEmpty()) {
+                            respondError(QStringLiteral("invalid_pack"),
+                                         QStringLiteral("the pack file has no readable modrinth.index.json"));
+                            return;
+                        }
+                        QStringList optionalPaths;
+                        for (const auto& fileValue : index.value("files").toArray()) {
+                            const QJsonObject file = fileValue.toObject();
+                            if (file.value("env").toObject().value("client").toString() == QStringLiteral("optional"))
+                                optionalPaths.append(file.value("path").toString());
+                        }
+                        if (!optionalPaths.isEmpty() && m_headless) {
+                            respondError(QStringLiteral("optional_mods"),
+                                         QStringLiteral("pack has %1 optional client files and the optional-mod dialog cannot be shown in "
+                                                        "headless mode; install it via the GUI or a file-level import instead: %2")
+                                             .arg(optionalPaths.size())
+                                             .arg(optionalPaths.mid(0, 10).join(QStringLiteral(", "))));
+                            return;
+                        }
+
+                        QString name = requestedName;
+                        if (name.isEmpty())
+                            name = index.value("name").toString();
+                        if (name.isEmpty())
+                            name = enriched->name;
+
+                        QMap<QString, QString> extraInfo;
+                        extraInfo.insert(QStringLiteral("pack_id"), enriched->addonId.toString());
+                        extraInfo.insert(QStringLiteral("pack_version_id"), version.fileId.toString());
+                        // trustedSource=true: the URL is Modrinth's own CDN link
+                        // from the API, and the untrusted-mods prompt is a dialog.
+                        auto* importTask = new InstanceImportTask(QUrl(version.downloadUrl), true, nullptr, std::move(extraInfo));
+                        importTask->setName(name);
+                        Task* wrapped = APPLICATION->instances()->wrapInstanceTask(importTask);
+                        wrapped->setParent(this);
+                        const QString taskId = trackTask(wrapped, QStringLiteral("create pack instance %1").arg(name));
+                        wrapped->start();
+
+                        QJsonObject result;
+                        result["taskId"] = taskId;
+                        result["name"] = name;
+                        result["version"] = version.version_number;
+                        if (!optionalPaths.isEmpty())
+                            result["optionalFiles"] = optionalPaths.size();
+                        sendResponse(socket, id, result, QString(), QString());
+                    });
+            download->start();
+        };
+        callbacks.on_fail = [respondError](QString reason, int) {
+            respondError(QStringLiteral("upstream"), QStringLiteral("Modrinth versions lookup failed: %1").arg(reason));
+        };
+        callbacks.on_abort = [respondError]() { respondError(QStringLiteral("upstream"), QStringLiteral("Modrinth versions lookup aborted")); };
+
+        ResourceAPI::VersionSearchArgs args{};
+        args.pack = enriched;
+        args.resourceType = ModPlatform::ResourceType::Modpack;
         auto job = api->getProjectVersions(std::move(args), std::move(callbacks));
         if (!job) {
             respondError(QStringLiteral("upstream"), QStringLiteral("could not create versions job"));

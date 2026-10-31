@@ -52,6 +52,10 @@ class BridgeServer : public QObject {
     bool start();
     bool isListening() const;
 
+    // True when the launcher runs with --agent-headless (no user at a GUI to
+    // answer dialogs); set by Application right after construction.
+    void setHeadless(bool headless) { m_headless = headless; }
+
    private:
     struct Client {
         QLocalSocket* socket = nullptr;
@@ -87,6 +91,7 @@ class BridgeServer : public QObject {
                       const QString& errorMessage);
     void handleModSearch(Client* client, const QJsonValue& id, const QJsonObject& params);
     void handleModInstall(Client* client, const QJsonValue& id, const QJsonObject& params);
+    void handlePackCreate(Client* client, const QJsonValue& id, const QJsonObject& params);
     void broadcastNotification(const QString& method, const QJsonObject& params);
 
     // Returns the result value on success; on failure returns a null QJsonValue
@@ -101,6 +106,7 @@ class BridgeServer : public QObject {
     void onLogDirectoryChanged(const QString& path);
 
     QLocalServer* m_server = nullptr;
+    bool m_headless = false;
     QFileSystemWatcher* m_logWatcher = nullptr;
     QTimer* m_logTimer = nullptr;
     QList<Task::Ptr> m_pendingJobs;
