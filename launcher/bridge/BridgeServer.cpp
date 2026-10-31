@@ -1107,14 +1107,26 @@ QJsonValue BridgeServer::dispatch(const QString& method, const QJsonObject& para
         QSet<QString> seen;
         const QRegularExpression versionPattern(QStringLiteral("version \"([0-9]+(?:\\.[0-9]+)*)"));
         for (const QString& path : paths) {
+            if (path.isEmpty())
+                continue;
             const QString normalized = QDir::cleanPath(path);
             if (seen.contains(normalized))
                 continue;
             seen.insert(normalized);
+            // FindJavaPaths synthesizes a candidate per PATH directory; most
+            // do not exist. Drop those (bare names are left to QProcess).
+            const QFileInfo info(path);
+            if (info.isAbsolute() && !info.exists())
+                continue;
             QJsonObject obj;
             obj["path"] = path;
+            // javaw has no console and prints nothing for -version; probe the
+            // sibling java.exe instead.
+            QString probe = path;
+            if (probe.endsWith(QStringLiteral("javaw.exe"), Qt::CaseInsensitive))
+                probe = probe.left(probe.size() - 9) + QStringLiteral("java.exe");
             QProcess proc;
-            proc.start(path, { QStringLiteral("-version") });
+            proc.start(probe, { QStringLiteral("-version") });
             QString version;
             if (proc.waitForStarted(1500) && proc.waitForFinished(2500)) {
                 const QString err = QString::fromLocal8Bit(proc.readAllStandardError());
