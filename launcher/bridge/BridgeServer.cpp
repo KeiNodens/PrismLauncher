@@ -25,6 +25,11 @@
 #include "modplatform/ModIndex.h"
 #include "modplatform/ResourceAPI.h"
 #include "modplatform/modrinth/ModrinthAPI.h"
+#include "ResourceDownloadTask.h"
+#include "minecraft/MinecraftInstance.h"
+#include "minecraft/PackProfile.h"
+#include "net/Mode.h"
+#include "minecraft/mod/ModFolderModel.h"
 #include "settings/SettingsObject.h"
 #include "tasks/Task.h"
 
@@ -243,6 +248,10 @@ void BridgeServer::handleFrame(Client* client, const QJsonObject& request)
         handleModSearch(client, id, params);
         return;
     }
+    if (method == QStringLiteral("mod.install")) {
+        handleModInstall(client, id, params);
+        return;
+    }
 
     QString errorCode;
     QString errorMessage;
@@ -300,6 +309,161 @@ void BridgeServer::handleModSearch(Client* client, const QJsonValue& id, const Q
     m_pendingJobs.append(jobPtr);
     connect(job.get(), &Task::finished, this, [this, jobPtr]() { m_pendingJobs.removeAll(jobPtr); });
     job->start();
+}
+
+void BridgeServer::handleModInstall(Client* client, const QJsonValue& id, const QJsonObject& params)
+{
+    auto socket = client->socket;
+    auto alive = client->alive;
+    auto respondError = [this, socket, alive, id](const QString& code, const QString& message) {
+        if (*alive)
+            sendResponse(socket, id, QJsonValue(), code, message);
+    };
+
+    const QString instanceId = params.value("instanceId").toString();
+    const QString projectId = params.value("projectId").toString();
+    const QString wantedVersionId = params.value("versionId").toString();
+    auto* baseInst = APPLICATION->instances()->getInstanceById(instanceId);
+    auto* inst = dynamic_cast<MinecraftInstance*>(baseInst);
+    if (!inst) {
+        respondError(QStringLiteral("not_found"), QStringLiteral("no Minecraft instance with id %1").arg(instanceId));
+        return;
+    }
+    if (projectId.isEmpty()) {
+        respondError(QStringLiteral("invalid_params"), QStringLiteral("mod.install needs projectId"));
+        return;
+    }
+
+    // Resolve the instance's Minecraft version and loader from its PackProfile.
+    // The profile's component list is loaded lazily; force the on-disk load so
+    // the version filters below are not silently empty.
+    auto* profile = inst->getPackProfile();
+    if (profile && profile->getComponentVersion(QStringLiteral("net.minecraft")).isEmpty())
+        profile->reload(Net::Mode::Offline);
+    const QString mcVersion = profile ? profile->getComponentVersion(QStringLiteral("net.minecraft")) : QString();
+    ModPlatform::ModLoaderTypes loaderTypes;
+    QString loaderUid;
+    if (profile) {
+        const QList<QPair<QString, ModPlatform::ModLoaderType>> candidates = {
+            { QStringLiteral("net.minecraftforge"), ModPlatform::ModLoaderType::Forge },
+            { QStringLiteral("net.neoforged"), ModPlatform::ModLoaderType::NeoForge },
+            { QStringLiteral("net.fabricmc.fabric-loader"), ModPlatform::ModLoaderType::Fabric },
+            { QStringLiteral("org.quiltmc.quilt-loader"), ModPlatform::ModLoaderType::Quilt },
+        };
+        for (const auto& candidate : candidates) {
+            if (!profile->getComponentVersion(candidate.first).isEmpty()) {
+                loaderUid = candidate.first;
+                loaderTypes = ModPlatform::ModLoaderTypes(candidate.second);
+                break;
+            }
+        }
+    }
+
+    auto pack = std::make_shared<ModPlatform::IndexedPack>();
+    pack->addonId = projectId;
+    pack->provider = ModPlatform::ResourceProvider::MODRINTH;
+
+    auto api = std::make_shared<ModrinthAPI>();
+    // The resource metadata writer needs the pack's name/slug, which only the
+    // project-info response carries; fetch it first, then resolve versions
+    // for the enriched pack.
+    ResourceAPI::Callback<ModPlatform::IndexedPack::Ptr> infoCallbacks{};
+    infoCallbacks.on_succeed = [this, socket, alive, id, api, inst, wantedVersionId, mcVersion, loaderTypes,
+                                respondError](ModPlatform::IndexedPack::Ptr& enriched) {
+        if (!*alive)
+            return;
+        ResourceAPI::Callback<QVector<ModPlatform::IndexedVersion>> callbacks{};
+        callbacks.on_succeed = [this, socket, alive, id, api, enriched, inst, wantedVersionId](QVector<ModPlatform::IndexedVersion>& versions) {
+            if (!*alive)
+                return;
+            const ModPlatform::IndexedVersion* chosen = nullptr;
+            for (const auto& version : versions) {
+                if (!wantedVersionId.isEmpty()) {
+                    if (version.fileId.toString() == wantedVersionId || version.addonId.toString() == wantedVersionId)
+                        chosen = &version;
+                    continue;
+                }
+                if (!chosen || (chosen->version_type != ModPlatform::IndexedVersionType::Release &&
+                                version.version_type == ModPlatform::IndexedVersionType::Release))
+                    chosen = &version;
+            }
+            if (!chosen) {
+                sendResponse(socket, id, QJsonValue(), QStringLiteral("not_found"),
+                             QStringLiteral("no matching version for this instance (mc/loader filter applied)"));
+                return;
+            }
+            ModPlatform::IndexedVersion version = *chosen;
+
+            auto download = makeShared<ResourceDownloadTask>(enriched, version, inst->loaderModList());
+            const QString taskId = trackTask(download.get(), QStringLiteral("install mod %1").arg(enriched->name));
+            Task::Ptr holder = download;
+            m_pendingJobs.append(holder);
+            connect(download.get(), &Task::finished, this, [this, socket, alive, id, holder, version, taskId]() {
+                m_pendingJobs.removeAll(holder);
+                if (!*alive)
+                    return;
+                auto it = m_tasks.find(taskId);
+                if (it != m_tasks.end() && it->state == QStringLiteral("succeeded")) {
+                    QJsonObject result;
+                    result["installed"] = true;
+                    result["fileName"] = version.fileName;
+                    result["version"] = version.version_number;
+                    result["taskId"] = taskId;
+                    QJsonArray deps;
+                    for (const auto& dep : version.dependencies) {
+                        QJsonObject depObj;
+                        depObj["projectId"] = dep.addonId.toString();
+                        depObj["type"] = ModPlatform::DependencyTypeUtils::toString(dep.type);
+                        if (!dep.version.isEmpty())
+                            depObj["version"] = dep.version;
+                        deps.append(depObj);
+                    }
+                    result["dependencies"] = deps;
+                    sendResponse(socket, id, result, QString(), QString());
+                } else {
+                    QString reason = (it != m_tasks.end() ? it->failReason : QStringLiteral("download failed"));
+                    sendResponse(socket, id, QJsonValue(), QStringLiteral("task_failed"), reason);
+                }
+            });
+            download->start();
+        };
+        callbacks.on_fail = [respondError](QString reason, int) {
+            respondError(QStringLiteral("upstream"), QStringLiteral("Modrinth versions lookup failed: %1").arg(reason));
+        };
+        callbacks.on_abort = [respondError]() { respondError(QStringLiteral("upstream"), QStringLiteral("Modrinth versions lookup aborted")); };
+
+        ResourceAPI::VersionSearchArgs args{};
+        args.pack = enriched;
+        if (!mcVersion.isEmpty())
+            args.mcVersions = std::vector<Version>{ Version(mcVersion) };
+        if (loaderTypes != ModPlatform::ModLoaderTypes{})
+            args.loaders = loaderTypes;
+        args.resourceType = ModPlatform::ResourceType::Mod;
+
+        auto job = api->getProjectVersions(std::move(args), std::move(callbacks));
+        if (!job) {
+            respondError(QStringLiteral("upstream"), QStringLiteral("could not create versions job"));
+            return;
+        }
+        Task::Ptr jobPtr = job;
+        m_pendingJobs.append(jobPtr);
+        connect(job.get(), &Task::finished, this, [this, jobPtr]() { m_pendingJobs.removeAll(jobPtr); });
+        job->start();
+    };
+    infoCallbacks.on_fail = [respondError](QString reason, int) {
+        respondError(QStringLiteral("upstream"), QStringLiteral("Modrinth project lookup failed: %1").arg(reason));
+    };
+    infoCallbacks.on_abort = [respondError]() { respondError(QStringLiteral("upstream"), QStringLiteral("Modrinth project lookup aborted")); };
+
+    auto infoJob = api->getProjectInfo({ pack }, std::move(infoCallbacks), false);
+    if (!infoJob) {
+        respondError(QStringLiteral("upstream"), QStringLiteral("could not create project info job"));
+        return;
+    }
+    Task::Ptr infoJobPtr = infoJob;
+    m_pendingJobs.append(infoJobPtr);
+    connect(infoJob.get(), &Task::finished, this, [this, infoJobPtr]() { m_pendingJobs.removeAll(infoJobPtr); });
+    infoJob->start();
 }
 
 QString BridgeServer::trackTask(Task* task, const QString& label)

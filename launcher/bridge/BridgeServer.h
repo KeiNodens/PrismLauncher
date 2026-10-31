@@ -86,6 +86,7 @@ class BridgeServer : public QObject {
     void sendResponse(QLocalSocket* socket, const QJsonValue& id, const QJsonValue& result, const QString& errorCode,
                       const QString& errorMessage);
     void handleModSearch(Client* client, const QJsonValue& id, const QJsonObject& params);
+    void handleModInstall(Client* client, const QJsonValue& id, const QJsonObject& params);
     void broadcastNotification(const QString& method, const QJsonObject& params);
 
     // Returns the result value on success; on failure returns a null QJsonValue
