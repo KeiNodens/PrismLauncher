@@ -493,6 +493,8 @@ set(API_SOURCES
     modplatform/ModIndex.cpp
     modplatform/CrossSourceRefs.h
     modplatform/CrossSourceRefs.cpp
+    modplatform/CrossSourceResolveTask.h
+    modplatform/CrossSourceResolveTask.cpp
     modplatform/ResourceType.h
     modplatform/ResourceType.cpp
 

@@ -31,6 +31,7 @@ class ModModel : public ResourceModel {
 
     void setFilter(std::shared_ptr<ModFilterWidget::Filter> filter) { m_filter = filter; }
     virtual QVariant getInstalledPackVersion(ModPlatform::IndexedPack::Ptr) const override;
+    QString getCrossInstalledVersion(ModPlatform::IndexedPack::Ptr) const override;
 
     [[nodiscard]] QString debugName() const override { return m_debugName; }
     [[nodiscard]] QString metaEntryBase() const override { return m_metaEntryBase; }

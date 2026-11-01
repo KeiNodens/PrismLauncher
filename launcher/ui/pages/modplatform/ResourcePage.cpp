@@ -45,6 +45,7 @@
 #include <QDesktopServices>
 #include <QKeyEvent>
 #include <QMessageBox>
+#include <QStandardItemModel>
 #include <algorithm>
 #include <utility>
 
@@ -310,6 +311,13 @@ void ResourcePage::versionListUpdated(const QModelIndex& index)
 
         if (currentPack) {
             auto installedVersion = m_model->getInstalledPackVersion(currentPack);
+            // Agent bridge addition: the pack may be installed via the other
+            // provider; its version ids live in a different namespace, so the
+            // marker matches on the recorded version number instead.
+            auto crossVersion = m_model->getCrossInstalledVersion(currentPack);
+            const QString crossProviderName =
+                currentPack->provider == ModPlatform::ResourceProvider::FLAME ? QStringLiteral("Modrinth") : QStringLiteral("CurseForge");
+            bool crossMarked = false;
 
             for (int i = 0; i < currentPack->versions.size(); i++) {
                 auto& version = currentPack->versions[i];
@@ -324,8 +332,20 @@ void ResourcePage::versionListUpdated(const QModelIndex& index)
                 if (version.fileId == installedVersion) {
                     versionText += tr(" [installed]", "Mod version select");
                 }
+                if (!crossVersion.isEmpty() && version.version == crossVersion) {
+                    versionText += tr(" [installed via %1]", "Mod version select").arg(crossProviderName);
+                    crossMarked = true;
+                }
 
                 m_ui->versionSelectionBox->addItem(versionText, QVariant(i));
+            }
+            if (!crossVersion.isEmpty() && !crossMarked && m_ui->versionSelectionBox->count() > 0) {
+                m_ui->versionSelectionBox->addItem(tr("Installed via %1: %2", "Mod version select").arg(crossProviderName, crossVersion),
+                                                   QVariant(-3));
+                if (auto* itemModel = qobject_cast<QStandardItemModel*>(m_ui->versionSelectionBox->model())) {
+                    if (auto* item = itemModel->item(m_ui->versionSelectionBox->count() - 1))
+                        item->setEnabled(false);
+                }
             }
         }
         if (m_ui->versionSelectionBox->count() == 0) {

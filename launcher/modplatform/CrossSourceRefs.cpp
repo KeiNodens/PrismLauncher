@@ -3,6 +3,7 @@
 #include "CrossSourceRefs.h"
 
 #include <QDateTime>
+#include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
@@ -12,6 +13,11 @@
 #include "Application.h"
 
 namespace {
+
+QString refsPath()
+{
+    return APPLICATION->dataRoot() + QStringLiteral("/prismlauncher-mcp/crossrefs.json");
+}
 
 QJsonObject& pairsCache()
 {
@@ -27,9 +33,7 @@ QDateTime& cacheStamp()
 
 void reloadIfChanged()
 {
-    const QString path = APPLICATION->dataRoot() + QStringLiteral("/prismlauncher-mcp/crossrefs.json");
-    const QFileInfo info(path);
-    if (!info.exists()) {
+    const QFileInfo info(refsPath());    if (!info.exists()) {
         if (!pairsCache().isEmpty())
             pairsCache() = {};
         cacheStamp() = {};
@@ -37,7 +41,7 @@ void reloadIfChanged()
     }
     if (cacheStamp().isValid() && info.lastModified() <= cacheStamp())
         return;
-    QFile file(path);
+    QFile file(refsPath());
     if (!file.open(QIODevice::ReadOnly))
         return;
     const auto doc = QJsonDocument::fromJson(file.readAll());
@@ -62,4 +66,39 @@ QVariant CrossSourceRefs::projectId(const QString& slug, bool modrinth)
     }
     const auto value = entry.value(QStringLiteral("curseforge"));
     return value.isDouble() ? QVariant::fromValue<qlonglong>(static_cast<qlonglong>(value.toDouble())) : QVariant();
+}
+
+QJsonObject CrossSourceRefs::allPairs()
+{
+    static QMutex mutex;
+    const QMutexLocker lock(&mutex);
+    reloadIfChanged();
+    return pairsCache();
+}
+
+void CrossSourceRefs::mergePairs(const QJsonObject& newPairs)
+{
+    static QMutex mutex;
+    const QMutexLocker lock(&mutex);
+    reloadIfChanged();
+    auto merged = pairsCache();
+    for (auto it = newPairs.begin(); it != newPairs.end(); ++it) {
+        auto entry = merged.value(it.key()).toObject();
+        const auto incoming = it.value().toObject();
+        for (auto jt = incoming.begin(); jt != incoming.end(); ++jt)
+            entry.insert(jt.key(), jt.value());
+        merged.insert(it.key(), entry);
+    }
+    const QJsonObject root{ { QStringLiteral("version"), 1 },
+                            { QStringLiteral("updatedAt"), QDateTime::currentDateTimeUtc().toString(Qt::ISODate) },
+                            { QStringLiteral("pairs"), merged } };
+    const QString path = refsPath();
+    QDir().mkpath(QFileInfo(path).absolutePath());
+    QFile file(path);
+    if (file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        file.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+        file.close();
+        pairsCache() = merged;
+        cacheStamp() = QFileInfo(path).lastModified();
+    }
 }

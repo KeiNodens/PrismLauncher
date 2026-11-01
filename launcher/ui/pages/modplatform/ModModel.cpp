@@ -8,6 +8,9 @@
 #include "minecraft/PackProfile.h"
 #include "minecraft/mod/ModFolderModel.h"
 #include "modplatform/CrossSourceRefs.h"
+#include "modplatform/CrossSourceResolveTask.h"
+
+#include <QSet>
 #include "modplatform/ModIndex.h"
 
 #include <QMessageBox>
@@ -17,7 +20,22 @@ namespace ResourceDownload {
 
 ModModel::ModModel(BaseInstance& base_inst, ResourceAPI* api, QString debugName, QString metaEntryBase)
     : ResourceModel(api), m_base_instance(base_inst), m_debugName(debugName + " (Model)"), m_metaEntryBase(metaEntryBase)
-{}
+{
+    // Agent bridge addition: refresh the cross-source reference table for
+    // this instance in the background (once per instance per session),
+    // then repaint so cross-source installs show as installed.
+    static QSet<QString> crossRefreshed;
+    const QString key = m_base_instance.id();
+    if (!crossRefreshed.contains(key)) {
+        crossRefreshed.insert(key);
+        auto task = new CrossSourceResolveTask(m_base_instance, this);
+        connect(task, &Task::finished, this, [this] {
+            if (rowCount(QModelIndex()) > 0)
+                emit dataChanged(index(0), index(rowCount(QModelIndex()) - 1), {});
+        });
+        task->start();
+    }
+}
 
 /******** Make data requests ********/
 
@@ -98,8 +116,8 @@ bool ModModel::isPackInstalled(ModPlatform::IndexedPack::Ptr pack) const
 
     // The same project may be installed from the OTHER provider (browsing
     // CurseForge while the Modrinth copy is installed, or vice versa).
-    // prismlauncher-mcp records slug <-> id pairs in crossrefs.json; consult
-    // it before answering "not installed".
+    // CrossSourceResolveTask and prismlauncher-mcp record slug <-> id pairs
+    // in crossrefs.json; consult it before answering "not installed".
     const bool otherIsModrinth = pack->provider == ModPlatform::ResourceProvider::FLAME;
     const auto otherId = CrossSourceRefs::projectId(pack->slug, otherIsModrinth);
     if (!otherId.isValid())
@@ -107,6 +125,21 @@ bool ModModel::isPackInstalled(ModPlatform::IndexedPack::Ptr pack) const
     const auto otherProvider = otherIsModrinth ? ModPlatform::ResourceProvider::MODRINTH : ModPlatform::ResourceProvider::FLAME;
     return std::any_of(allMods.cbegin(), allMods.cend(),
                        [&matches, otherProvider, &otherId](Mod* mod) { return matches(mod, otherProvider, otherId); });
+}
+
+QString ModModel::getCrossInstalledVersion(ModPlatform::IndexedPack::Ptr pack) const
+{
+    const bool otherIsModrinth = pack->provider == ModPlatform::ResourceProvider::FLAME;
+    const auto otherId = CrossSourceRefs::projectId(pack->slug, otherIsModrinth);
+    if (!otherId.isValid())
+        return {};
+    const auto otherProvider = otherIsModrinth ? ModPlatform::ResourceProvider::MODRINTH : ModPlatform::ResourceProvider::FLAME;
+    auto allMods = static_cast<MinecraftInstance&>(m_base_instance).loaderModList()->allMods();
+    for (auto mod : allMods) {
+        if (auto meta = mod->metadata(); meta && meta->provider == otherProvider && meta->project_id == otherId)
+            return meta->version_number;
+    }
+    return {};
 }
 
 QVariant ModModel::getInstalledPackVersion(ModPlatform::IndexedPack::Ptr pack) const

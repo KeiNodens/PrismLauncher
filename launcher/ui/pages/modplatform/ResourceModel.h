@@ -54,6 +54,10 @@ class ResourceModel : public QAbstractListModel {
     auto getSortingMethods() const { return m_api->getSortingMethods(); }
 
     virtual QVariant getInstalledPackVersion(ModPlatform::IndexedPack::Ptr) const { return {}; }
+
+    // Agent bridge addition: when the pack is installed via the OTHER provider,
+    // the version number recorded for that copy; empty otherwise.
+    virtual QString getCrossInstalledVersion(ModPlatform::IndexedPack::Ptr) const { return {}; }
     /** Whether the version is opted out or not. Currently only makes sense in CF. */
     virtual bool optedOut(const ModPlatform::IndexedVersion& ver) const
     {
