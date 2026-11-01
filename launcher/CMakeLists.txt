@@ -491,6 +491,8 @@ set(META_SOURCES
 set(API_SOURCES
     modplatform/ModIndex.h
     modplatform/ModIndex.cpp
+    modplatform/CrossSourceRefs.h
+    modplatform/CrossSourceRefs.cpp
     modplatform/ResourceType.h
     modplatform/ResourceType.cpp
 

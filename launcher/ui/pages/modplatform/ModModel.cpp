@@ -7,6 +7,7 @@
 #include "minecraft/MinecraftInstance.h"
 #include "minecraft/PackProfile.h"
 #include "minecraft/mod/ModFolderModel.h"
+#include "modplatform/CrossSourceRefs.h"
 #include "modplatform/ModIndex.h"
 
 #include <QMessageBox>
@@ -86,11 +87,26 @@ void ModModel::searchWithTerm(const QString& term, unsigned int sort, bool filte
 bool ModModel::isPackInstalled(ModPlatform::IndexedPack::Ptr pack) const
 {
     auto allMods = static_cast<MinecraftInstance&>(m_base_instance).loaderModList()->allMods();
-    return std::any_of(allMods.cbegin(), allMods.cend(), [pack](Mod* mod) {
+    auto matches = [](Mod* mod, ModPlatform::ResourceProvider provider, const QVariant& id) {
         if (auto meta = mod->metadata(); meta)
-            return meta->provider == pack->provider && meta->project_id == pack->addonId;
+            return meta->provider == provider && meta->project_id == id;
         return false;
-    });
+    };
+    if (std::any_of(allMods.cbegin(), allMods.cend(),
+                    [pack, &matches](Mod* mod) { return matches(mod, pack->provider, pack->addonId); }))
+        return true;
+
+    // The same project may be installed from the OTHER provider (browsing
+    // CurseForge while the Modrinth copy is installed, or vice versa).
+    // prismlauncher-mcp records slug <-> id pairs in crossrefs.json; consult
+    // it before answering "not installed".
+    const bool otherIsModrinth = pack->provider == ModPlatform::ResourceProvider::FLAME;
+    const auto otherId = CrossSourceRefs::projectId(pack->slug, otherIsModrinth);
+    if (!otherId.isValid())
+        return false;
+    const auto otherProvider = otherIsModrinth ? ModPlatform::ResourceProvider::MODRINTH : ModPlatform::ResourceProvider::FLAME;
+    return std::any_of(allMods.cbegin(), allMods.cend(),
+                       [&matches, otherProvider, &otherId](Mod* mod) { return matches(mod, otherProvider, otherId); });
 }
 
 QVariant ModModel::getInstalledPackVersion(ModPlatform::IndexedPack::Ptr pack) const
